@@ -1,9 +1,15 @@
 import asyncio
 import re
 import sys
-import time
 from datetime import datetime
 from bleak import BleakScanner, BleakClient
+
+from rich.console import Console
+from rich.layout import Layout
+from rich.panel import Panel
+from rich.live import Live
+from rich.table import Table
+from rich import box
 
 # --- Configuration ---
 SCAN_TIMEOUT = 5.0
@@ -15,18 +21,26 @@ UART_NOTIFY_UUID  = "0000fff1-0000-1000-8000-00805f9b34fb"
 UART_WRITE_UUID   = "0000fff2-0000-1000-8000-00805f9b34fb"
 
 ELM_INIT_COMMANDS = ["ATZ", "ATE0", "ATL0", "ATS0"]
-VOLTAGE_PID = "0142"
-VOLTAGE_RE = re.compile(r"41\s*42\s*([0-9A-Fa-f]{2})\s*([0-9A-Fa-f]{2})")
+
+# Global stats storage
+stats = {
+    "voltage": 0.0,
+    "rpm": 0,
+    "speed": 0,
+    "coolant": 0,
+    "load": 0,
+    "throttle": 0,
+    "status_msg": "Initializing...",
+    "device_name": "None",
+    "last_update": "--:--:--",
+    "health": "Unknown"
+}
 
 class OBDBleReader:
     def __init__(self):
         self.client = None
         self.response_buffer = ""
         self.response_event = None
-
-    def log(self, msg):
-        ts = datetime.now().strftime("%H:%M:%S")
-        print(f"[{ts}] {msg}", flush=True)
 
     def notification_handler(self, sender, data):
         decoded = data.decode("ascii", errors="replace")
@@ -35,52 +49,139 @@ class OBDBleReader:
             if self.response_event:
                 self.response_event.set()
 
-    async def send_command(self, cmd, wait=2.0):
+    async def send_command(self, cmd, timeout=1.5):
+        if not self.client or not self.client.is_connected:
+            return ""
         self.response_buffer = ""
         self.response_event.clear()
-        
-        full_cmd = f"{cmd}\r".encode()
-        await self.client.write_gatt_char(UART_WRITE_UUID, full_cmd, response=False)
-        
         try:
-            await asyncio.wait_for(self.response_event.wait(), timeout=wait)
-        except asyncio.TimeoutError:
+            await self.client.write_gatt_char(UART_WRITE_UUID, f"{cmd}\r".encode(), response=False)
+            await asyncio.wait_for(self.response_event.wait(), timeout=timeout)
+        except:
             pass
-        
         return self.response_buffer.strip()
 
-    async def initialize(self):
-        for cmd in ELM_INIT_COMMANDS:
-            resp = await self.send_command(cmd)
-            self.log(f"  {cmd} -> {resp!r}")
-            await asyncio.sleep(0.3)
+    def parse_hex(self, resp, pid, expected_bytes):
+        # Clean response: remove spaces, echoes, and prompt
+        clean = "".join(resp.split()).upper()
+        # Look for 41 + PID
+        pattern = f"41{pid}([0-9A-F]{{{expected_bytes*2}}})"
+        match = re.search(pattern, clean)
+        if match:
+            return match.group(1)
+        return None
 
-    async def get_voltage(self):
-        resp = await self.send_command(VOLTAGE_PID)
-        # Remove spaces and non-hex chars to be safe
-        clean_resp = "".join(resp.split())
-        match = VOLTAGE_RE.search(clean_resp)
-        if not match:
-            # Try a more liberal match since spaces are off
-            match = re.search(r"4142([0-9A-Fa-f]{4})", clean_resp)
-            if match:
-                hex_val = match.group(1)
-                high = int(hex_val[0:2], 16)
-                low = int(hex_val[2:4], 16)
-                return ((high * 256) + low) / 1000.0
-            return None
-            
-        high = int(match.group(1), 16)
-        low = int(match.group(2), 16)
-        return ((high * 256) + low) / 1000.0
+    async def update_data(self):
+        # 0. Connection check
+        if not self.client or not self.client.is_connected:
+            return
 
-    async def run(self):
-        self.log("OBD-II BLE Voltage Reader starting...")
-        self.response_event = asyncio.Event()
-        
+        # 1. Voltage (PID 42)
+        r = await self.send_command("0142")
+        h = self.parse_hex(r, "42", 2)
+        if h:
+            val = int(h, 16)
+            stats["voltage"] = val / 1000.0
+            stats["health"] = self.get_health_label(stats["voltage"])
+
+        # 2. RPM (PID 0C)
+        r = await self.send_command("010C")
+        h = self.parse_hex(r, "0C", 2)
+        if h:
+            stats["rpm"] = int(int(h, 16) / 4)
+
+        # 3. Speed (PID 0D)
+        r = await self.send_command("010D")
+        h = self.parse_hex(r, "0D", 1)
+        if h:
+            stats["speed"] = int(h, 16)
+
+        # 4. Coolant (PID 05)
+        r = await self.send_command("0105")
+        h = self.parse_hex(r, "05", 1)
+        if h:
+            stats["coolant"] = int(h, 16) - 40
+
+        # 5. Engine Load (PID 04)
+        r = await self.send_command("0104")
+        h = self.parse_hex(r, "04", 1)
+        if h:
+            stats["load"] = int(int(h, 16) * 100 / 255)
+
+        # 6. Throttle Position (PID 11)
+        r = await self.send_command("0111")
+        h = self.parse_hex(r, "11", 1)
+        if h:
+            stats["throttle"] = int(int(h, 16) * 100 / 255)
+
+        stats["last_update"] = datetime.now().strftime("%H:%M:%S")
+
+    def get_health_label(self, v):
+        if v >= 13.2: return "[bold green]Healthy (Charging)[/]"
+        if v >= 12.4: return "[green]Healthy (Good)[/]"
+        if v >= 12.0: return "[yellow]Warning (Low Load)[/]"
+        if v >= 11.6: return "[bold orange]Critical (Might not start)[/]"
+        return "[bold red]DANGER (Battery Dead?)[/]"
+
+def make_layout() -> Layout:
+    layout = Layout()
+    layout.split_column(
+        Layout(name="header", size=3),
+        Layout(name="main"),
+        Layout(name="footer", size=3)
+    )
+    layout["main"].split_row(
+        Layout(name="left"),
+        Layout(name="right")
+    )
+    return layout
+
+def get_dashboard_content():
+    # Left Panel: Vital Gauges
+    table = Table(show_header=False, box=box.SIMPLE, expand=True)
+    table.add_row("[cyan]Engine RPM[/]", f"[bold]{stats['rpm']}[/] rpm")
+    table.add_row("[cyan]Vehicle Speed[/]", f"[bold]{stats['speed']}[/] km/h")
+    table.add_row("[cyan]Engine Load[/]", f"[bold]{stats['load']}%[/]")
+    table.add_row("[cyan]Throttle Pos[/]", f"[bold]{stats['throttle']}%[/]")
+    table.add_row("[cyan]Coolant Temp[/]", f"[bold]{stats['coolant']}[/] °C")
+    
+    # Right Panel: Battery & Connection
+    batt_table = Table(show_header=False, box=box.SIMPLE, expand=True)
+    v_color = "red" if stats["voltage"] < 11.8 else "green"
+    batt_table.add_row("[magenta]Battery Voltage[/]", f"[bold {v_color}]{stats['voltage']:.2f} V[/]")
+    batt_table.add_row("[magenta]Battery Health[/]", stats["health"])
+    batt_table.add_row("")
+    batt_table.add_row("[grey70]OBD Device[/]", f"[white]{stats['device_name']}[/]")
+    batt_table.add_row("[grey70]Last Update[/]", stats["last_update"])
+
+    return Panel(table, title="[bold cyan]Engine Data[/]", border_style="cyan"), \
+           Panel(batt_table, title="[bold magenta]Power & Connectivity[/]", border_style="magenta")
+
+def update_layout(layout):
+    """Refreshes all components of the layout with current stats."""
+    # Update Header
+    layout["header"].update(Panel("[bold white]OBD-II Dashboard for macOS (BLE)[/]", style="on blue", box=box.SQUARE))
+    
+    # Update Footer with dynamic status
+    layout["footer"].update(Panel(f"[bold yellow]Status:[/] {stats['status_msg']}", border_style="dim"))
+    
+    # Update Main Panels
+    left, right = get_dashboard_content()
+    layout["left"].update(left)
+    layout["right"].update(right)
+
+async def main():
+    console = Console()
+    reader = OBDBleReader()
+    layout = make_layout()
+    
+    with Live(layout, refresh_per_second=4, screen=True) as live:
         while True:
+            # 1. Discovery
+            stats["status_msg"] = "🔍 Scanning for OBD-II BLE Devices (5s)..."
+            update_layout(layout)
+            
             try:
-                self.log(f"Scanning for OBD-II BLE devices ({SCAN_TIMEOUT}s)...")
                 devices = await BleakScanner.discover(timeout=SCAN_TIMEOUT)
                 target = None
                 for d in devices:
@@ -90,36 +191,60 @@ class OBDBleReader:
                         break
                 
                 if not target:
-                    self.log("No OBD-II device found. Retrying...")
+                    stats["status_msg"] = "❌ Device not found. Re-scanning in 3s..."
+                    update_layout(layout)
                     await asyncio.sleep(3)
                     continue
 
-                self.log(f"Connecting to {target.name} ({target.address})...")
+                # 2. Connection
+                stats["status_msg"] = f"🔗 Connecting to [bold cyan]{target.name}[/]..."
+                update_layout(layout)
+                
                 async with BleakClient(target.address) as client:
-                    self.client = client
-                    self.log("Connected! Initializing ELM327...")
-                    
-                    await client.start_notify(UART_NOTIFY_UUID, self.notification_handler)
-                    await self.initialize()
-                    
-                    while client.is_connected:
-                        voltage = await self.get_voltage()
-                        if voltage is not None:
-                            ts = datetime.now().strftime("%H:%M:%S")
-                            print(f"[{ts}] {voltage:.2f} V", flush=True)
-                        else:
-                            # self.log("Check if engine is on/OBD is ready.")
-                            pass
-                        await asyncio.sleep(1.0)
+                    try:
+                        reader.client = client
+                        reader.response_event = asyncio.Event()
+                        stats["device_name"] = target.name
+                        stats["status_msg"] = "⚙️ Initializing ELM327 protocol..."
+                        update_layout(layout)
                         
+                        await client.start_notify(UART_NOTIFY_UUID, reader.notification_handler)
+                        
+                        # Init ELM with visual feedback
+                        for i, cmd in enumerate(ELM_INIT_COMMANDS):
+                            stats["status_msg"] = f"⚙️ Sending {cmd} ({i+1}/{len(ELM_INIT_COMMANDS)})..."
+                            update_layout(layout)
+                            await reader.send_command(cmd)
+                            await asyncio.sleep(0.1)
+                        
+                        stats["status_msg"] = "🚀 Dashboard Live"
+                        update_layout(layout)
+                        
+                        # 3. Reading Loop
+                        while client.is_connected:
+                            await reader.update_data()
+                            update_layout(layout)
+                            await asyncio.sleep(0.5)
+                    finally:
+                        stats["status_msg"] = "🧹 Closing connection gracefully..."
+                        update_layout(layout)
+                        if client.is_connected:
+                            await client.stop_notify(UART_NOTIFY_UUID)
+                            await client.disconnect()
+                        stats["device_name"] = "None"
+                        await asyncio.sleep(0.5)
+                        
+            except asyncio.CancelledError:
+                break
             except Exception as e:
-                self.log(f"Error or Disconnect: {e}")
+                stats["status_msg"] = f"⚠️ Error: {str(e)[:50]}"
+                stats["device_name"] = "None"
+                update_layout(layout)
                 await asyncio.sleep(3)
-                self.log("Reconnecting...")
 
 if __name__ == "__main__":
     try:
-        reader = OBDBleReader()
-        asyncio.run(reader.run())
+        asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nStopped.")
+        # Final cleanup for terminal
+        pass

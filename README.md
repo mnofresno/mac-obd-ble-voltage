@@ -1,6 +1,12 @@
-# macOS OBD-II BLE Voltage Reader
+This project provides a beautiful Terminal User Interface (TUI) for reading vehicle battery voltage and engine performance telemetry from an ELM327 OBD-II adapter on macOS using Bluetooth Low Energy (BLE).
 
-This project provides a simple Python-based solution for reading vehicle battery voltage from an ELM327 OBD-II adapter on macOS using Bluetooth Low Energy (BLE).
+![OBD-II Dashboard](https://raw.githubusercontent.com/mnofresno/mac-obd-ble-voltage/main/research/tui_preview.png)
+
+## Features
+- **Real-time TUI Dashboard:** Built with `Rich` for a premium terminal experience.
+- **Battery Health Analysis:** Categorizes voltage state (Safe, Low, Critical).
+- **Engine Metrics:** Displays RPM, Vehicle Speed, Coolant Temperature, and Engine Load.
+- **BLE Native:** No manual macOS serial pairing required.
 
 ## Research Summary
 

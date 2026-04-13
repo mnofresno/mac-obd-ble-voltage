@@ -125,6 +125,20 @@ def try_connect():
     return None
 
 
+def get_status_label(voltage):
+    """Returns a human-readable status."""
+    if voltage >= 13.2:
+        return "✅ Safe (Alternator Charging)"
+    elif voltage >= 12.4:
+        return "✅ Safe (Good)"
+    elif voltage >= 12.0:
+        return "⚠️ Warning (Low)"
+    elif voltage >= 11.6:
+        return "❌ Critical (Low - Might not start)"
+    else:
+        return "🚨 EXTREME LOW (Battery Dead?)"
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -155,8 +169,9 @@ def main() -> None:
 
                 if voltage is not None:
                     consecutive_failures = 0
+                    status = get_status_label(voltage)
                     ts = datetime.now().strftime("%H:%M:%S")
-                    print(f"[{ts}] {voltage:.2f} V", flush=True)
+                    print(f"[{ts}] {voltage:.2f} V - {status}", flush=True)
                 else:
                     consecutive_failures += 1
                     log(f"Failed to read voltage ({consecutive_failures} consecutive)")
