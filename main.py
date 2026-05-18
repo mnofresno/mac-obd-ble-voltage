@@ -30,6 +30,7 @@ stats = {
     "coolant": 0,
     "load": 0,
     "throttle": 0,
+    "brake": "N/A",
     "status_msg": "Initializing...",
     "device_name": "None",
     "last_update": "--:--:--",
@@ -114,6 +115,25 @@ class OBDBleReader:
         if h:
             stats["throttle"] = int(int(h, 16) * 100 / 255)
 
+        # --- TOYOTA ENHANCED (Experimental for Etios) ---
+        # PID 2101 usually contains many flags for Toyota
+        r = await self.send_command("2101", timeout=2.0)
+        # We look for a longer response starting with 6101 (Mode 21 -> 61)
+        clean = "".join(r.split()).upper()
+        if "6101" in clean:
+            try:
+                # Brake switch is often in the 12th or 13th byte
+                # This is a guestimate for Etios 2016, needs live testing
+                # We'll show the raw hex if we can't be sure, but let's try a common mask
+                # Let's just track if the brake is pressed via a common Toyota bitmask
+                # Usually: Byte 12, Bit 5 (0x20)
+                payload = clean.split("6101")[-1]
+                if len(payload) >= 26: 
+                    byte_13 = int(payload[24:26], 16)
+                    stats["brake"] = "ON" if (byte_13 & 0x20) else "OFF"
+            except:
+                stats["brake"] = "ERR"
+
         stats["last_update"] = datetime.now().strftime("%H:%M:%S")
 
     def get_health_label(self, v):
@@ -144,6 +164,10 @@ def get_dashboard_content():
     table.add_row("[cyan]Engine Load[/]", f"[bold]{stats['load']}%[/]")
     table.add_row("[cyan]Throttle Pos[/]", f"[bold]{stats['throttle']}%[/]")
     table.add_row("[cyan]Coolant Temp[/]", f"[bold]{stats['coolant']}[/] °C")
+    
+    # Toyota Specifics
+    b_color = "red" if stats["brake"] == "ON" else "green"
+    table.add_row("[yellow]Brake Pedal[/]", f"[bold {b_color}]{stats['brake']}[/]")
     
     # Right Panel: Battery & Connection
     batt_table = Table(show_header=False, box=box.SIMPLE, expand=True)
@@ -200,19 +224,26 @@ async def main():
                 stats["status_msg"] = f"🔗 Connecting to [bold cyan]{target.name}[/]..."
                 update_layout(layout)
                 
-                async with BleakClient(target.address) as client:
+                # Extended timeout and more aggressive connection attempts
+                async with BleakClient(target.address, timeout=15.0) as client:
                     try:
                         reader.client = client
                         reader.response_event = asyncio.Event()
                         stats["device_name"] = target.name
-                        stats["status_msg"] = "⚙️ Initializing ELM327 protocol..."
+                        stats["status_msg"] = "⚙️ Sending Hard Reset (ATZ)..."
                         update_layout(layout)
                         
                         await client.start_notify(UART_NOTIFY_UUID, reader.notification_handler)
                         
-                        # Init ELM with visual feedback
-                        for i, cmd in enumerate(ELM_INIT_COMMANDS):
-                            stats["status_msg"] = f"⚙️ Sending {cmd} ({i+1}/{len(ELM_INIT_COMMANDS)})..."
+                        # Triple ATZ to force the ELM327 firmware to drop old states
+                        for _ in range(3):
+                            await reader.send_command("ATZ", timeout=2.0)
+                            await asyncio.sleep(0.2)
+                        
+                        # Init sequences with specific Toyota protocol check
+                        init_cmds = ["ATE0", "ATL0", "ATS0", "ATSP0"]
+                        for i, cmd in enumerate(init_cmds):
+                            stats["status_msg"] = f"⚙️ Initializing: {cmd} ({i+1}/{len(init_cmds)})..."
                             update_layout(layout)
                             await reader.send_command(cmd)
                             await asyncio.sleep(0.1)
@@ -228,9 +259,13 @@ async def main():
                     finally:
                         stats["status_msg"] = "🧹 Closing connection gracefully..."
                         update_layout(layout)
-                        if client.is_connected:
-                            await client.stop_notify(UART_NOTIFY_UUID)
-                            await client.disconnect()
+                        try:
+                            if client.is_connected:
+                                # Try one last reset before leaving
+                                await reader.send_command("ATZ")
+                                await client.stop_notify(UART_NOTIFY_UUID)
+                                await client.disconnect()
+                        except: pass
                         stats["device_name"] = "None"
                         await asyncio.sleep(0.5)
                         
