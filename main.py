@@ -16,9 +16,9 @@ from pids import PID_DATABASE, SIMPLE_PIDS
 # --- Config ---
 SCAN_TIMEOUT = 5.0
 ELM_INIT_COMMANDS = ["ATZ", "ATE0", "ATL0", "ATS0"]
-UART_SERVICE_UUID = "0000fff0-0000-1000-8000-00805f9b34fb"
-UART_NOTIFY_UUID = "0000fff1-0000-1000-8000-00805f9b34fb"
-UART_WRITE_UUID = "0000fff2-0000-1000-8000-00805f9b34fb"
+UART_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"  # Nordic UART Service
+UART_NOTIFY_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"  # Nordic UART TX (notify)
+UART_WRITE_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"   # Nordic UART RX (write)
 
 # --- Global state ---
 stats: dict[str, str] = {}
@@ -41,7 +41,7 @@ class OBDBleReader:
             return ""
         self.buf = ""; self.ev.clear()
         try:
-            await self.client.write_gatt_char(UART_WRITE_UUID, f"{c}\r".encode(), response=False)
+            await self.client.write_gatt_char(UART_WRITE_UUID, f"{c}\r".encode(), response=True)
             await asyncio.wait_for(self.ev.wait(), timeout=timeout)
         except:
             pass
